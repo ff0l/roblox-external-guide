@@ -1,757 +1,495 @@
-# Building Roblox Externals — A Practical Guide
+# Building Roblox Externals
 
-A structured walkthrough for Windows developers who want to understand how Roblox externals are built, why they break, and how to design one that survives updates.
+How a Windows external actually talks to Roblox: attach, offsets, resolve, snapshot, then draw.
 
-This guide is written from real project experience (FF0L / servy-ui). It focuses on architecture, tooling, and debugging — not copy-paste cheat code.
+This is how [FF0L](https://github.com/ff0l/Roblox-external) is wired. Names below (`offsets::Boot`, `world::Attach`, `Snap`) are from that tree.
 
----
-
-## Table of contents
-
-1. [What you are building](#1-what-you-are-building)
-2. [Before you start](#2-before-you-start)
-3. [How Roblox is laid out in memory](#3-how-roblox-is-laid-out-in-memory)
-4. [The external pipeline](#4-the-external-pipeline)
-5. [Process attach and memory reads](#5-process-attach-and-memory-reads)
-6. [Offsets — the moving target](#6-offsets--the-moving-target)
-7. [The LIVE channel trap](#7-the-live-channel-trap)
-8. [Resolving the game world](#8-resolving-the-game-world)
-9. [Walking the instance tree](#9-walking-the-instance-tree)
-10. [Players, characters, and bones](#10-players-characters-and-bones)
-11. [Camera, view matrix, and world-to-screen](#11-camera-view-matrix-and-world-to-screen)
-12. [ESP — drawing what you read](#12-esp--drawing-what-you-read)
-13. [Aim and input (high level)](#13-aim-and-input-high-level)
-14. [Overlay UI architecture](#14-overlay-ui-architecture)
-15. [Click-through and hit-testing](#15-click-through-and-hit-testing)
-16. [Threading and frame budget](#16-threading-and-frame-budget)
-17. [Project layout that scales](#17-project-layout-that-scales)
-18. [Debugging when nothing works](#18-debugging-when-nothing-works)
-19. [Update survival checklist](#19-update-survival-checklist)
-20. [Tools worth learning](#20-tools-worth-learning)
-21. [Legal and safety notes](#21-legal-and-safety-notes)
-22. [Further reading](#22-further-reading)
+Roblox updates often. Offsets move. If your client is not on the LIVE channel, nothing after attach will make sense.
 
 ---
 
-## 1. What you are building
+## Contents
 
-A **Roblox external** is a separate Windows program that:
+**Part I — Setup**
 
-1. Finds the running Roblox client (`RobloxPlayerBeta.exe`)
-2. Opens the process with read (and optionally write) access
-3. Uses **version-specific offsets** to locate engine structures in memory
-4. Reads game state (players, parts, camera, health, etc.)
-5. Presents features through an **overlay** (ESP boxes, menu, watermark) or by sending input
+1. [What an external is](#1-what-an-external-is)
+2. [What you need](#2-what-you-need)
 
-It does **not** inject into Roblox. It runs outside the game. That is why it is called *external*.
+**Part II — The pipeline**
 
-```
-┌─────────────────────┐         ReadProcessMemory / WriteProcessMemory
-│   Your external     │ ───────────────────────────────────────────────►
-│   (ff0l.exe)        │         OpenProcess, NtReadVirtualMemory
-└─────────────────────┘
-         │
-         │  Own window (transparent overlay)
-         ▼
-┌─────────────────────┐
-│ RobloxPlayerBeta    │  DataModel → Workspace, Players, Camera, Parts…
-│ (separate process)  │
-└─────────────────────┘
-```
+3. [The loop](#3-the-loop)
+4. [Offsets](#4-offsets)
+5. [Attach](#5-attach)
+6. [The LIVE channel](#6-the-live-channel)
+7. [Resolve](#7-resolve)
+8. [The instance tree](#8-the-instance-tree)
+9. [Pulse](#9-pulse)
+10. [Players and bones](#10-players-and-bones)
+11. [World to screen](#11-world-to-screen)
+12. [ESP](#12-esp)
+13. [Aim](#13-aim)
 
-**Internal** cheats inject a DLL and run code inside Roblox. Externals avoid injection but depend entirely on correct offsets and stable read paths.
+**Part III — The rest**
 
----
-
-## 2. Before you start
-
-### Skills you need
-
-| Area | Minimum | Why |
-| --- | --- | --- |
-| C++ | Comfortable with headers-only helpers, structs, Win32 | Most externals are C++ on Windows |
-| Win32 | Processes, windows, messages, DPI | Attach + overlay |
-| Linear algebra | Basic 3×3 / 4×4 matrix multiply | World-to-screen |
-| Debugging | x64dbg or similar, logging | When offsets rot |
-| Patience | Required | Roblox updates weekly |
-
-### Environment
-
-- **OS:** Windows 10/11 x64
-- **IDE:** Visual Studio 2022+ with *Desktop development with C++* and CMake
-- **Target game:** Roblox desktop (`RobloxPlayerBeta.exe`)
-- **Network:** Needed once to fetch offset dumps; cache locally after that
-
-### What this guide assumes you are *not* doing
-
-- Shipping a frozen offset list inside your exe forever
-- Ignoring Roblox deployment channels
-- Reading memory every frame without caching or throttling discovery
-- Drawing ESP before `Snap.ready` is true
+14. [The tick](#14-the-tick)
+15. [Layout](#15-layout)
+16. [Nothing works](#16-nothing-works)
+17. [After an update](#17-after-an-update)
 
 ---
 
-## 3. How Roblox is laid out in memory
+## Part I — Setup
 
-Roblox is a native C++ client. At runtime you care about a chain roughly like this:
+## 1. What an external is
+
+A separate process. It does not inject.
+
+1. Find `RobloxPlayerBeta.exe`
+2. `OpenProcess`
+3. Use offsets for *this* Roblox build
+4. Read DataModel / Players / parts / camera
+5. Draw on your own overlay, or move the mouse
 
 ```
-Module base (RobloxPlayerBeta.exe)
-    │
-    ▼
-FakeDataModel pointer          ← static RVA from offset dump
-    │
-    ▼
-Real DataModel                 ← pointer at FakeDataModel + RealDataModel offset
-    │
-    ├── Workspace                ← services under DataModel
-    ├── Players
-    ├── Lighting
-    └── …
-            │
-            ▼
-        Player instances
-            │
-            ▼
-        Character Model
-            │
-            ├── Humanoid       (health, walkspeed, …)
-            └── Parts          (Head, HumanoidRootPart, limbs…)
+your exe  -- ReadProcessMemory / NtReadVirtualMemory -->  RobloxPlayerBeta
+   |
+   +-- own window (ESP, menu)
 ```
 
-Parallel to DataModel, many externals also read:
+An internal loads a DLL into Roblox. An external lives outside and dies the moment offsets are wrong.
 
-- **VisualEngine** — view matrix, screen dimensions
-- **TaskScheduler** — jobs, FPS cap (advanced)
-- **MouseService** — silent-aim style hooks (advanced, high risk)
+---
 
-Each arrow is an offset. If any offset is wrong for your build, everything downstream is garbage.
+## 2. What you need
 
-### Key structs (conceptual)
+- Windows 10/11 x64
+- C++ and Win32 (processes, windows, `ReadProcessMemory`)
+- Enough matrix math to project a point
+- Visual Studio 2022 + CMake, or whatever already builds the tree (`build.bat` in FF0L)
 
-Your code typically defines mirrors like:
+Target: desktop Roblox. Process names we look for:
 
-| Your struct | Purpose |
+```
+RobloxPlayerBeta.exe
+RobloxPlayer.exe
+Windows10Universal.exe
+```
+
+---
+
+## Part II — The pipeline
+
+## 3. The loop
+
+Do not walk Roblox memory from the draw function. Split it.
+
+```
+offsets::Boot     fetch / cache JSON
+      |
+world::Attach     PID, handle, module base
+      |
+world::Resolve    FakeDataModel -> DataModel -> Workspace, Players
+      |
+world::Pulse      fill Snap (actors, view, camera)
+      |
+draw / aim        read Snap only
+```
+
+In FF0L that is one `Tick()`:
+
+```
+offsets::Boot()
+TickChannel()                          // client version vs dump version
+world::Pulse(Want, NeedAim, Skel, ...)
+TickAim(...)
+```
+
+`Pulse` only calls `Attach` / `Resolve` when something actually needs the world:
+
+```
+Want = Esp.on || Aim.on || Mute.on
+```
+
+If every feature is off, `Pulse` returns immediately. Menu still opens. Attach never runs. That is why a “working menu” and a dead ESP can happen at the same time — the toggles default off, and they live in collapsed folds.
+
+`Snap` is the frame snapshot. `Actor` is one player on that snapshot. The overlay reads `world::View()`, it does not call `Kids()`.
+
+---
+
+## 4. Offsets
+
+An offset is either:
+
+- an RVA from `RobloxPlayerBeta.exe` (FakeDataModel pointer, VisualEngine pointer)
+- a field displacement on a live object (Workspace on DataModel, Health on Humanoid)
+
+They change every LIVE dump.
+
+### Host
+
+FF0L uses [offsets.imtheo.lol](https://offsets.imtheo.lol):
+
+| Path | What you get |
 | --- | --- |
-| `Actor` | One player/character worth of cached state for ESP/aim |
-| `Snap` | One frame snapshot: view matrix, client rect, actor list |
-| `Engine` | Process handle, base address, resolved pointers, offset table |
-| `Off` | All numeric offsets loaded from JSON |
+| `/roblox/version` | LIVE version string, e.g. `version-f5a60436d48947d3` |
+| `/offsets.json` | Nested map: class → field → number |
 
-Keep game mirrors separate from UI state. The renderer should consume `Snap`, not walk Roblox memory while drawing.
+HTTPS, WinHTTP, TLS 1.2.
 
----
+The JSON object has keys `Roblox Version`, `Dumped At`, `Total Offsets`, and `Offsets`. Under `Offsets` each class is an object of field names to integers. Do not paste last week’s numbers into source.
 
-## 4. The external pipeline
-
-A maintainable external splits work into stages. FF0L follows this pattern:
-
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ offsets::Boot│───►│ world::Attach│───►│world::Resolve│───►│ world::Pulse │
-│ fetch/cache  │    │ find process │    │ DataModel    │    │ build Snap   │
-└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
-                                                                    │
-                                                                    ▼
-                                                          ┌──────────────┐
-                                                          │ Draw / Aim   │
-                                                          │ (per frame)  │
-                                                          └──────────────┘
-```
-
-### Stage responsibilities
-
-| Stage | Runs when | Success looks like |
-| --- | --- | --- |
-| **Boot offsets** | Once at startup (+ manual refresh) | `offsets::Ready()` true, version string known |
-| **Attach** | Until process found | `OpenProcess` handle, module base, game HWND |
-| **Resolve** | After attach, periodically | `DataModel`, `Workspace`, `Players` non-null |
-| **Pulse** | Each frame when features need data | `Snap.ready == true`, `Snap.count > 0` |
-| **Render** | Each overlay frame | ESP/FOV/menu drawn from `Snap` only |
-
-**Rule:** If `Pulse` early-returns because no feature is enabled, attach may never run and the menu can look fine while the game path is dead. Gate features explicitly in UI copy and diagnostics.
-
----
-
-## 5. Process attach and memory reads
-
-### Finding Roblox
-
-Scan for process names (newest clients use `RobloxPlayerBeta.exe`):
+Load them at runtime:
 
 ```cpp
-static const wchar_t* Names[] = {
-    L"RobloxPlayerBeta.exe",
-    L"RobloxPlayer.exe",
-    L"Windows10Universal.exe"
-};
+O.fakeDm      = offsets::Get("FakeDataModel", "Pointer");
+O.realDm      = offsets::Get("FakeDataModel", "RealDataModel");
+O.dmWorkspace = offsets::Get("DataModel", "Workspace");
+O.playerLocal = offsets::Get("Player", "LocalPlayer");
 ```
 
-Use `CreateToolhelp32Snapshot` / `Process32FirstW` to get PID, then `OpenProcess`.
+`LoadOff()` maps the rest the same way (Instance children, Humanoid, Primitive, Camera, VisualEngine, …).
 
-### Access levels
+### Cache
 
-| Flags | Effect |
-| --- | --- |
-| `PROCESS_VM_READ \| PROCESS_QUERY_INFORMATION` | Read-only external (ESP, radar) |
-| `+ PROCESS_VM_WRITE \| PROCESS_VM_OPERATION` | Movement, silent aim, noclip |
+`offsets::Sync`:
 
-If `OpenProcess` fails with access denied, run as admin is **not** always the fix — protected processes and anti-cheat policies matter. Start read-only until attach is stable.
+1. GET `/roblox/version`
+2. Compare to `%AppData%\ff0l\offsets.version`
+3. If it changed (or cache is missing), GET `/offsets.json`, parse, write `offsets.json` + `offsets.version`
+4. If the network fails, load the last cache and mark it stale
 
-### Module base
+`Boot()` runs `Sync` once on the first tick (this can stall that frame). A later Refresh uses `Request()`, which runs `Sync` on a detached thread.
 
-Resolve `RobloxPlayerBeta.exe` base with `Module32FirstW` / `CreateToolhelp32Snapshot`. All static RVAs from offset dumps are **relative to this base**.
+If `offsets::Ready()` is false, `Resolve` has nothing to stand on.
 
-### Reading memory safely
+---
 
-Pattern every read through helpers:
+## 5. Attach
 
-1. Validate address (`>= 0x10000`, canonical user range)
-2. Read via `ReadProcessMemory` or `NtReadVirtualMemory`
-3. Track fail counts; detach if process exits
+`world::Attach()`:
 
-Never treat a non-null pointer as valid without range checks and occasional re-validation.
+1. If we already have a handle and the process is still alive, keep it (and `LoadOff` if offsets just became ready)
+2. Otherwise wait 1500 ms between attempts
+3. Snapshot processes, match one of the three exe names (`FindPid` keeps the last match)
+4. `OpenProcess` — write+read first, then read-only, then `PROCESS_QUERY_LIMITED_INFORMATION` + read
+5. Module base via `CreateToolhelp32Snapshot` / `Module32FirstW`
+6. Find the game HWND
+7. `LoadOff()`
 
-### Client version from the process path
+Reads go through `Pull`. Address must pass `Heap` (`>= 0x10000` and below the user canonical top). Prefer `NtReadVirtualMemory` if `BindNt()` found it, else `ReadProcessMemory`. `Ptr()` is `Pull` + `Heap` on the value.
 
-Roblox installs per build under:
+A non-null pointer is not a valid object. If Roblox exits, `GetExitCodeProcess` is not `STILL_ACTIVE` and we detach.
+
+Write features need `PROCESS_VM_WRITE`. ESP does not.
+
+---
+
+## 6. The LIVE channel
+
+This is the usual “menu works, ESP does not” case.
+
+Roblox ships more than one client at a time. [offsets.imtheo.lol](https://offsets.imtheo.lol/docs/live-channel) only dumps **LIVE**.
+
+Your install looks like:
 
 ```
 %LOCALAPPDATA%\Roblox\Versions\version-<hash>\RobloxPlayerBeta.exe
 ```
 
-Parse `version-*` from `QueryFullProcessImageNameA` and compare to your offset dump version string. **Mismatch means do not trust any pointer chain** — see [Section 7](#7-the-live-channel-trap).
+`ReadClientVer` takes the process path (`QueryFullProcessImageNameA`) and cuts out `version-…`. `TickChannel` compares that to `offsets::CopyVersion()` every 2 seconds.
+
+If they differ:
+
+- Attach still works (you found a process)
+- JSON still parses (you have *a* dump)
+- `base + FakeDataModel` is the wrong RVA
+- `Resolve` fails or returns junk
+- `Snap.ready` stays false
+- ESP / aim draw nothing
+
+The app does **not** flip your toggles off. The world path just never becomes ready. FF0L opens a modal (`DrawChannelNotice`) with the Fishstrap steps. You can dismiss it. That does not fix the dump.
+
+### Switch to LIVE
+
+From [Switching to LIVE](https://offsets.imtheo.lol/docs/live-channel):
+
+1. Download [Fishstrap](https://www.fishstrap.app/Fishstrap.exe) (from fishstrap.app — their GitHub was taken down)
+2. Install it, open **Fishstrap** from Windows search
+3. **Configure Settings**
+4. **Deployment**
+5. Channel: `production`, press Enter
+6. Automatic channel change: **Never change**
+7. **Save and Launch**
+
+Launch Roblox through Fishstrap after that. The folder name should match [offsets.imtheo.lol/roblox/version](https://offsets.imtheo.lol/roblox/version).
 
 ---
 
-## 6. Offsets — the moving target
+## 7. Resolve
 
-Offsets are numeric constants (RVAs and structure field displacements) produced by reverse engineering each Roblox build.
+`Resolve()` turns base + offsets into live pointers.
 
-### Where dumps come from
+```
+Fake      = Ptr(base + off.fakeDm)
+DataModel = Ptr(Fake + off.realDm)
+Workspace = Ptr(DataModel + off.dmWorkspace)   // or FindService(..., "Workspace")
+Players   = FindService(DataModel, "Players")
+Local     = Ptr(Players + off.playerLocal)
+Visual    = Ptr(base + off.visPtr)             // optional, for the view matrix
+```
 
-FF0L uses [offsets.imtheo.lol](https://offsets.imtheo.lol):
+If Workspace is missing, FF0L also tries the parent of Workspace for Players.
 
-| Endpoint | Returns |
+`Resolve` returns true when `Players != 0`. It caches DataModel / Workspace / Players / Local / Visual. Re-run every 800 ms when Players, Workspace, and Local are all set, otherwise every 400 ms.
+
+PlaceId (if the dump has it) is read here and handed to `sense::BindPlace` for game-specific team / vis rules.
+
+If Fake or DataModel is 0, stop. Do not invent a fallback chain.
+
+---
+
+## 8. The instance tree
+
+Children sit between `ChildrenStart` and `ChildrenEnd`.
+
+`Kids()` tries two layouts, then remembers `kidMode`:
+
+- **0** — start / end are on the instance
+- **1** — `ChildrenStart` is a pointer to a small header, then start / end
+
+Each layout tries stride 16, then stride 8. Span is capped. Empty or huge ranges are rejected.
+
+`FindService` walks kids: class name first (`ClassDescriptor` → `ClassName`), then instance name.
+
+### Strings
+
+Roblox strings are SSO. `ReadRoblox`:
+
+1. Length at `Misc.StringLength`, or 16 if that offset is missing
+2. Length `< 16` → bytes sit on the object
+3. Length `>= 16` → pointer at the object
+4. Reject non-printable junk
+
+Bad offsets produce garbage names. That is usually how you notice `NameContainer` or `StringLength` moved.
+
+---
+
+## 9. Pulse
+
+`Pulse(Want, NeedAim, Skel, Range, NeedVis)` builds `Snap`.
+
+| Arg | In FF0L |
 | --- | --- |
-| `/roblox/version` | Current LIVE version string, e.g. `version-f5a60436d48947d3` |
-| `/offsets.json` | Full nested map: class → field → hex offset |
+| `Want` | ESP, aim, or silent/mute on |
+| `NeedAim` | aim or mute on (extra bones) |
+| `Skel` | `Esp.skeleton` |
+| `Range` | ESP distance cap |
+| `NeedVis` | ESP on, or aim/mute vis check |
 
-Example JSON shape (simplified):
+If `Want` is false: `count = 0`, return. No attach.
 
-```json
-{
-  "Roblox Version": "version-f5a60436d48947d3",
-  "Offsets": {
-    "FakeDataModel": { "Pointer": 147496136, "RealDataModel": 504 },
-    "DataModel": { "Workspace": 344, "PlaceId": 400 },
-    "Instance": { "ChildrenStart": 120, "NameContainer": 112 },
-    "Player": { "LocalPlayer": 304, "ModelInstance": 664 }
-  }
-}
-```
-
-### Loading into your code
-
-Map JSON into an `Off` struct at runtime:
-
-```cpp
-O.fakeDm = offsets::Get("FakeDataModel", "Pointer");
-O.realDm = offsets::Get("FakeDataModel", "RealDataModel");
-O.dmWorkspace = offsets::Get("DataModel", "Workspace");
-O.playerLocal = offsets::Get("Player", "LocalPlayer");
-// …
-```
-
-Never hardcode hundreds of offsets in source unless you enjoy rebuilding every patch.
-
-### Caching strategy
-
-1. On boot, HTTP GET live version
-2. If version changed, download fresh JSON
-3. Write `%AppData%\YourApp\offsets.json` + `offsets.version`
-4. If offline, load cache and mark `stale`
-
-Expose **Refresh** in settings and show the active hash in UI.
-
----
-
-## 7. The LIVE channel trap
-
-This is the most common “menu works, ESP doesn’t” bug for beginners.
-
-### What Roblox channels are
-
-Roblox ships multiple client builds (channels). Not every user runs the same `version-*` folder at the same time.
-
-**Offset dump hosts typically dump only the LIVE (production) channel.**
-
-If your installed client is:
-
-```
-version-241079e43bd84c46   ← your PC
-```
-
-But the dump says:
-
-```
-version-f5a60436d48947d3   ← LIVE dump
-```
+Otherwise: `Attach` + `Resolve`. Missing workspace or players → `ready = false`, `count = 0`.
 
 Then:
 
-- Attach succeeds (you found the process)
-- Offsets load (JSON parsed fine)
-- **Resolve fails or returns nonsense** (FakeDataModel RVA is for a different binary)
-- ESP/aim never get `Snap.ready`
+1. `Discover` at most every 700 ms (or immediately if nobody is tracked)
+2. `ClientBox()` — Roblox client rect (`GetClientRect` + `ClientToScreen`)
+3. View size from VisualEngine dimensions when they look sane (64–8000), else the client size
+4. View matrix from VisualEngine
+5. Camera position / right vector from `Workspace.CurrentCamera`
+6. For each tracked actor: team, head/root, velocity, health, distance, ping, optional bones, optional wall check
+7. Skip local (`self`), dead (`health <= 0.05`), out of range, or a character that failed `Heap`
 
-Symptoms: watermark fine, menu fine, “resolving” or empty world forever.
+`Snap.ready = true` after that path succeeds, **even if `count` is 0** (empty server, everyone filtered). ESP still requires `count > 0`.
 
-### Fix — switch to LIVE with Fishstrap
+Visibility uses cached wall parts plus hysteresis (`visGood` / `visBad`) so boxes do not flicker every frame.
 
-Official walkthrough: [Switching to LIVE](https://offsets.imtheo.lol/docs/live-channel)
-
-1. Download [Fishstrap](https://www.fishstrap.app/Fishstrap.exe)
-2. Install and open **Fishstrap** from Windows search
-3. **Configure Settings** → **Deployment**
-4. Set **Channel** to `production`, press Enter
-5. Set **Automatic channel change action** to **Never change**
-6. **Save and Launch**
-
-Always launch Roblox through Fishstrap after that. Verify your folder name matches the dump on [offsets.imtheo.lol/roblox/version](https://offsets.imtheo.lol/roblox/version).
-
-### What your external should do
-
-Compare client path version vs dump version every few seconds. On mismatch:
-
-- Show a modal with the Fishstrap steps (do not silently fail)
-- Disable ESP/aim until versions match
-- Link to live-channel docs
-
-FF0L implements this as `TickChannel()` + `DrawChannelNotice()`.
+Keep discovery off the per-frame path. Pulse already does that.
 
 ---
 
-## 8. Resolving the game world
+## 10. Players and bones
 
-`Resolve()` turns offsets + base address into live pointers.
+`Discover`:
 
-### Minimal resolve flow
+1. `Kids(Players)`
+2. Keep `Class == Player`
+3. `ModelInstance` → character
+4. Humanoid by class, then by name
+5. DisplayName / instance name / humanoid name
+6. `RigType` (non-zero treated as R15)
+7. `BindBones`
 
-```cpp
-uintptr_t Fake = Read<uintptr_t>(base + off.fakeDm);
-uintptr_t DataModel = Read<uintptr_t>(Fake + off.realDm);
-if (!DataModel) return false;
+Local is stored with `self = true` and dropped later in Pulse, not skipped during discovery.
 
-uintptr_t Workspace = Read<uintptr_t>(DataModel + off.dmWorkspace);
-if (!Workspace) Workspace = FindService(DataModel, "Workspace");
+### Rigs
 
-uintptr_t Players = FindService(DataModel, "Players");
-uintptr_t LocalPlayer = Read<uintptr_t>(Players + off.playerLocal);
-```
-
-Cache `DataModel`, `Workspace`, `Players`. Re-resolve on a timer (400–800 ms) or when pointers go stale.
-
-### VisualEngine
-
-Optional but needed for accurate ESP projection:
-
-```cpp
-uintptr_t Visual = Read<uintptr_t>(base + off.visPtr);
-Read view matrix from Visual + off.visView;
-Read dimensions from Visual + off.visDim;
-```
-
-### Readiness flag
-
-Set `Snap.ready = true` only when:
-
-- Process attached
-- DataModel + Players resolved
-- At least discovery pass can run
-- View matrix / client rect sane
-
-UI and ESP must check `Snap.ready` before drawing.
-
----
-
-## 9. Walking the instance tree
-
-Roblox objects inherit from `Instance`. Children live in a contiguous array:
-
-| Field | Role |
-| --- | --- |
-| `ChildrenStart` | Pointer to child pointer array |
-| `ChildrenEnd` | End marker or count helper (dump-specific) |
-
-`Kids()` typically tries two layouts (direct vs pointer-to-array) and caches `kidMode` once detected.
-
-### Finding a service by name
-
-```cpp
-uintptr_t FindService(uintptr_t DataModel, const char* Want) {
-    for each child :
-        if ClassName(child) == Want) return child;
-        if Name(child) == Want) return named;
-    return 0;
-}
-```
-
-Class names come from `ClassDescriptor` → `ClassName` string reads.
-
-### Reading Roblox strings
-
-Roblox uses small string optimization. Your reader should:
-
-1. Read length at `Misc.StringLength` (often +16)
-2. If length < 16, data inline; else pointer at object base
-3. Reject non-printable garbage (bad offsets produce bad strings)
-
-Cache `nameMode` once a valid name decode works.
-
----
-
-## 10. Players, characters, and bones
-
-### Discovery loop (throttled)
-
-Do **not** full-scan every frame. FF0L uses ~700 ms discovery intervals:
-
-1. Iterate `Players` children
-2. Skip LocalPlayer for ESP targets
-3. Read `ModelInstance` → character model
-4. Find `Humanoid` + parts
-5. Fill `Actor` struct, push to `Snap.list[]`
-
-### R6 vs R15
-
-Rigs use different part names. Maintain two name tables:
+Name tables:
 
 | Slot | R15 | R6 |
 | --- | --- | --- |
 | Head | Head | Head |
 | Root | HumanoidRootPart | HumanoidRootPart |
 | Torso | UpperTorso / LowerTorso | Torso |
+| Limbs | LeftUpperArm, … | Left Arm, Left Leg, … |
 
-Map aliases (`Left Leg` → multiple bone slots) for games that use simplified rigs.
+`BindBones` is not only those strings. It also:
 
-### Health and filters
+- takes Humanoid.HumanoidRootPart / Model.PrimaryPart
+- maps `Left Leg` / `Right Leg` onto several bone slots
+- uses hitbox part names some games add
+- if skeleton is on, assigns leftover low parts by side of the root
 
-Read from Humanoid:
+Games rename parts. If boxes exist and the skeleton looks drunk, the name table is the first place to look.
 
-- `Health`, `MaxHealth`
-- Skip if health ≤ 0
-- Optional: team check, distance range, visibility rays
+Hard cap: 64 actors (`ActorMax`).
 
 ---
 
-## 11. Camera, view matrix, and world-to-screen
+## 11. World to screen
 
-### Client area vs overlay
+`ClientBox` writes `clientX/Y/W/H` from the Roblox HWND. If the window is gone, fall back to the primary screen metrics.
 
-Roblox window client rect gives screen origin of the game view:
+`Project` uses the 4×4 view matrix from VisualEngine:
+
+```
+X = w·row0 + M[3]
+Y = w·row1 + M[7]
+W = w·row3 + M[15]
+if W < 0.05  → behind camera, skip
+ndc → pixel in viewW × viewH
+```
+
+`ToScreen` then:
+
+1. If VisualEngine size ≠ client size, scale
+2. Add `clientX`, `clientY`
+
+`EspDot` is `ToScreen` plus overlay-space conversion (`OverlayOf`). Draw in overlay pixels, not raw engine pixels.
+
+FOV rings use the game client size and a screen-space radius around the aim midpoint, not the overlay’s full monitor size.
+
+---
+
+## 12. ESP
+
+ESP only reads `Snap`.
 
 ```cpp
-GetClientRect(gameHwnd);
-ClientToScreen(gameHwnd, &origin);
-Snap.clientX/Y/W/H = …
+if (!Esp.on) return;
+const Snap& snap = world::View();
+if (!snap.ready || snap.count <= 0) return;
 ```
 
-Your overlay is fullscreen. Convert game client coords → overlay coords with `ScreenToClient(overlayHwnd, …)`.
+Then for each actor: range, team (`Esp.team && mate`), project head/feet/bones, box, name, health, skeleton.
 
-### Projection
-
-Given view matrix `V` (4×4 or 3×4 layout — match your dump), world position `w`:
-
-1. Transform to clip/NDC (implementation-specific)
-2. Reject behind camera
-3. Map to pixel coordinates inside `viewW × viewH`
-4. Add `clientX/clientY` offset for full-screen overlay
-
-Expose helpers:
-
-- `world::ToView(worldPos, dot)` — engine space
-- `world::ToScreen(worldPos, dot)` — screen pixels
-- `EspDot(worldPos, overlayPoint)` — final draw space
-
-### FOV circles
-
-FOV radius in pixels is often derived from game client width/height and camera FOV, not overlay resolution. Recompute when Roblox window moves or resizes.
+No `ready` → no boxes. Wrong channel, failed resolve, or features off all look the same on screen.
 
 ---
 
-## 12. ESP — drawing what you read
+## 13. Aim
 
-ESP should be a **consumer** of `Snap`, not a scanner.
+Also a `Snap` consumer (`TickAim`).
 
-```cpp
-void DrawEspWorld(float scale) {
-    if (!Esp.on) return;
-    const Snap& snap = world::View();
-    if (!snap.ready || snap.count <= 0) return;
+1. Hold bind, menu not listening for a new key
+2. Pick a target (FOV, team, vis, distance, bone, sticky)
+3. Optional prediction from velocity / ping
+4. Either relative mouse move, or a write into mouse/camera state (`silent.hpp`)
 
-    for (int i = 0; i < snap.count; i++) {
-        const Actor& a = snap.list[i];
-        // project head/feet → box
-        // draw box, name, health bar, skeleton lines
-    }
-}
-```
+Writes are version-fragile. If you are learning the pipeline, get ESP on screen first.
 
-### Feature gating
-
-| Toggle | Must be true |
-| --- | --- |
-| ESP master | `Esp.on` |
-| World data | `Snap.ready && Snap.count > 0` |
-| Box visible | At least 2 projected points |
-| Team filter | `!a.mate` when team check on |
-
-### Color / visibility
-
-Optional wall checks cast rays from camera to target head. Hysteresis (`visGood` / `visBad` counters) stops flicker.
+This guide does not include write offsets, hooks, or bypasses.
 
 ---
 
-## 13. Aim and input (high level)
+## Part III — The rest
 
-Two common patterns:
+## 14. The tick
 
-| Type | Mechanism | Detectability |
-| --- | --- | --- |
-| **Mouse aimbot** | `SendInput` relative moves toward screen target | Moderate |
-| **Silent aim** | Manipulate aim ray / mouse service in memory | High |
+FF0L is a fullscreen DirectX 11 overlay (`ur::app::run`). One tick per frame.
 
-Design aim as:
+Order that matters:
 
-1. Target selection (FOV, distance, bone, team, visibility)
-2. Prediction (velocity × ping × distance factor)
-3. Application (mouse move or memory write)
+1. `offsets::Boot` — first call may hit the network
+2. `TickChannel` — version compare, maybe open the Fishstrap modal
+3. `world::Pulse` — only if a feature wants the world
+4. `TickAim` / movement
+5. Draw ESP from `Snap`, then the menu
 
-Keep selection in `TickAim()` separate from overlay drawing. Respect menu/listen modes so rebinding keys does not click targets.
-
-**This guide does not provide hook signatures or bypass methods.** Treat write paths as high-risk and version-fragile.
+Configs and the offset cache: `%AppData%\ff0l`.
 
 ---
 
-## 14. Overlay UI architecture
-
-FF0L uses a custom DirectX 11 overlay (`third_party/custom-framework`):
-
-```
-WinMain
-  └─ ur::app::run(Config, Tick)
-        ├─ CreateWindow (borderless, topmost, layered)
-        ├─ DX11 swapchain (glass / DISCARD path for transparency)
-        └─ each frame: Tick() → Engine render → Present
-```
-
-### Transparency paths (Windows)
-
-Working combo for click-through overlays:
-
-- `WS_EX_LAYERED` + `SetLayeredWindowAttributes`
-- `DwmExtendFrameIntoClientArea({-1,-1,-1,-1})`
-- DXGI swap effect `DISCARD`, BGRA format
-- Clear alpha 0 in UI background; premultiply where required
-
-Broken patterns (symptoms: black window or clicks eaten):
-
-- Flip model + premultiplied alpha without full pipeline support
-- `WS_EX_TRANSPARENT` without `WM_NCHITTEST` handling
-- Using virtual desktop metrics instead of primary monitor for placement
-
-### Menu vs world draw order
-
-Typical frame when menu open:
-
-1. Draw ESP / FOV on background route
-2. Draw semi-transparent menu shell
-3. Draw channel notice modal last (blocks click-through)
-
-When menu closed:
-
-- ESP + watermark only
-- Click-through except draggable watermark chip
-
----
-
-## 15. Click-through and hit-testing
-
-Maintain a boolean `click_through`:
-
-| Region | click_through |
-| --- | --- |
-| Over menu / modal | `false` |
-| Over watermark (if draggable) | `false` |
-| Empty overlay | `true` |
-
-Toggle `WS_EX_TRANSPARENT` and call `SetWindowPos(..., SWP_FRAMECHANGED)` when changing modes.
-
-Handle `WM_NCHITTEST` → return `HTTRANSPARENT` when click-through active so Windows forwards input to Roblox.
-
----
-
-## 16. Threading and frame budget
-
-| Work | Suggested thread | Interval |
-| --- | --- | --- |
-| Overlay render + input | Main thread | Every frame |
-| Offset HTTP fetch | Background thread | On boot / refresh |
-| Player discovery | Main thread (Pulse) | 500–700 ms |
-| Resolve pointers | Main thread | 400–800 ms |
-| Visibility rays | Main thread | When ESP vis check on |
-
-Avoid blocking WinHTTP on the render thread during gameplay.
-
-Cap reads per actor. ESP for 50 players with full skeleton every frame will spike CPU.
-
----
-
-## 17. Project layout that scales
-
-Example structure (based on FF0L):
+## 15. Layout
 
 ```
 src/
-  Main.cpp          ← UI, menu, ESP draw, tick loop
-  world.hpp         ← attach, resolve, pulse, projection
-  offsets.hpp       ← HTTP fetch, JSON parse, cache
-  silent.hpp        ← optional write features
-  move.hpp          ← movement writes
-  store.hpp         ← configs on disk
-  sense.hpp         ← game-specific team/vis rules
-assets/             ← fonts, icons (copied next to exe)
-third_party/        ← UI framework, fonts
-build.bat           ← one-click MSVC build
+  Main.cpp       tick, menu, ESP draw, channel modal
+  world.hpp      attach, resolve, pulse, project
+  offsets.hpp    HTTP, parse, cache
+  silent.hpp     optional writes
+  move.hpp       movement writes
+  sense.hpp      place-specific team / vis
+  store.hpp      configs
+assets/          fonts, icons (next to the exe)
+third_party/     overlay
+build.bat
 ```
 
-### Separation rules
-
-- **offsets.hpp** — never includes rendering headers
-- **world.hpp** — no UI types; pure data + Win32
-- **Main.cpp** — orchestration only; keep individual draw tabs in functions
+`offsets.hpp` should not know about drawing. `world.hpp` should not know about menu widgets. `Main.cpp` consumes `Snap`.
 
 ---
 
-## 18. Debugging when nothing works
-
-Use this decision tree:
+## 16. Nothing works
 
 ```
-Menu visible?
-  NO  → overlay/window creation, DX init
-  YES → Feature enabled (ESP/Aim toggle)?
-          NO  → expected: Pulse may not attach
-          YES → offsets::Ready()?
-                  NO  → network, cache, JSON parse
-                  YES → Client version == dump version?
-                          NO  → LIVE channel / Fishstrap
-                          YES → Snap.attached?
-                                  NO  → Roblox not running / OpenProcess fail
-                                  YES → Snap.ready?
-                                          NO  → Resolve: DataModel/Players
-                                          YES → Snap.count > 0?
-                                                  NO  → discovery, wrong place
-                                                  YES → projection / draw gate
+Menu on screen?
+  no  → overlay / D3D init
+  yes → ESP or aim actually enabled?
+          no  → Pulse never attaches. Open the fold, flip the switch.
+          yes → offsets::Ready()?
+                  no  → network, cache, JSON
+                  yes → client version == dump version?
+                          no  → Fishstrap, LIVE channel
+                          yes → Snap.attached?
+                                  no  → Roblox closed, or OpenProcess failed
+                                  yes → Snap.ready?
+                                          no  → Resolve (Fake / DataModel / Players)
+                                          yes → Snap.count > 0?
+                                                  no  → discovery, wrong place, everyone filtered
+                                                  yes → ToScreen / draw
 ```
 
-### Log lines worth adding (dev builds)
+Worth printing once in a debug build: dump version, client version, Fake / DataModel / Players, `ready`, `count`.
 
-- Offset version applied
-- Client version from process path
-- Resolve: Fake, DataModel, Players addresses (hex)
-- Pulse: discovered count, ready flag
-- First ESP projection failure reason
-
-### Common mistakes
-
-| Mistake | Symptom |
+| What you did | What you see |
 | --- | --- |
-| Wrong channel | Attach OK, never ready |
-| Stale offsets after patch | Random crashes, null Players |
-| Drawing before `Snap.ready` | Flicker at 0,0 or empty |
-| Using screen coords without client offset | ESP offset from game window |
-| Full child scan every frame | Stutter, high CPU |
-| Click-through always on | Cannot click menu |
+| Wrong channel | Attach ok, never ready |
+| Stale dump after a patch | Ready flapping, empty Players, junk names |
+| Feature still off | Menu fine, `Pulse` no-ops |
+| Drew before `ready` | Empty, or a box at 0,0 |
+| Forgot client origin | ESP shifted vs the game window |
+| `Kids` every frame | Stutter |
 
 ---
 
-## 19. Update survival checklist
+## 17. After an update
 
-When Roblox updates:
+- [offsets.imtheo.lol/roblox/version](https://offsets.imtheo.lol/roblox/version)
+- Your `Versions\version-*` folder matches that hash (Fishstrap if not)
+- Refresh offsets, or delete `%AppData%\ff0l\offsets.json` and `offsets.version`
+- Confirm Resolve: DataModel, Players, LocalPlayer
+- Confirm one ESP box at your real resolution
+- Check R6 / R15 and team on the place you actually play
 
-- [ ] Check [offsets.imtheo.lol/roblox/version](https://offsets.imtheo.lol/roblox/version)
-- [ ] Confirm your client folder matches LIVE hash
-- [ ] Refresh offsets in app or delete `%AppData%\YourApp\offsets.json`
-- [ ] Re-test Resolve (DataModel, Players, LocalPlayer)
-- [ ] Re-test ESP projection at multiple resolutions
-- [ ] Re-test team check and rig types (R6/R15 map)
-- [ ] Scan for renamed offsets in dump (ChildrenEnd, StringLength, etc.)
-
-Ship version compare in production builds. Users should never guess why features silently died.
+Do not ship a frozen offset table in the exe.
 
 ---
 
-## 20. Tools worth learning
+Using this on live games can break Roblox’s terms and get accounts banned. Writing another process is also how you get your own tool killed by the next client change. Read the FF0L tree if you want the real control flow — this file is the map, not a cheat drop.
 
-| Tool | Use |
-| --- | --- |
-| **Visual Studio + CMake** | Build/debug C++ overlay |
-| **x64dbg** | Attach to Roblox, inspect pointers (ToS compliance: solo dev learning) |
-| **IDA Pro / Ghidra** | Static analysis when dumps lag |
-| **Process Hacker** | Verify handles, module base, command line |
-| **Fishstrap** | Force LIVE channel |
-| **offsets.imtheo.lol** | Versioned offset JSON |
-| **RenderDoc** | DX11 overlay alpha debugging |
-
-Learning order:
-
-1. Read-only attach + print LocalPlayer name
-2. Resolve Workspace + enumerate one child
-3. Project HumanoidRootPart to screen, draw a dot
-4. Build ESP box
-5. Add menu + config system
-6. Only then explore write features
+Reference: [ff0l/Roblox-external](https://github.com/ff0l/Roblox-external) · dumps: [offsets.imtheo.lol](https://offsets.imtheo.lol)
 
 ---
 
-## 21. Legal and safety notes
-
-- Manipulating online games may violate Roblox [Terms of Use](https://en.help.roblox.com/hc/en-us/articles/203313410-Roblox-Community-Standards) and result in account action.
-- Distributing cheats can carry legal exposure depending on jurisdiction.
-- Reading or writing other processes can trigger anti-cheat or platform protections.
-- This guide is for **educational understanding of Windows game client architecture**.
-
-Build on private experiences. Do not harass developers or publish working bypasses targeting live player populations.
-
----
-
-## 22. Further reading
-
-| Resource | Topic |
-| --- | --- |
-| [offsets.imtheo.lol](https://offsets.imtheo.lol) | LIVE offset dumps |
-| [Switching to LIVE](https://offsets.imtheo.lol/docs/live-channel) | Fishstrap / production channel |
-| [FF0L source](https://github.com/ff0l/Roblox-external) | Reference external implementation |
-| Microsoft Learn — `OpenProcess`, `ReadProcessMemory` | Win32 memory API |
-| Microsoft Learn — `DwmExtendFrameIntoClientArea` | Glass overlay |
-
----
-
-## Quick reference card
-
-```
-ATTACH     Find Roblox PID → OpenProcess → module base
-OFFSETS    Fetch JSON for LIVE version → cache locally
-VERSION    Parse version-* from process path → must match dump
-RESOLVE    FakeDM → RealDM → Workspace + Players
-PULSE      Discover actors → fill Snap → set ready
-PROJECT    World → view matrix → screen → overlay coords
-DRAW       if (ready && count) draw ESP; else skip
-CHANNEL    mismatch → show Fishstrap modal, not silent fail
-```
-
----
-
-<p align="center"><sub>Guide maintained alongside FF0L development. Feedback and corrections welcome via issues on this repository.</sub></p>
+Text created with AI. xd
